@@ -1,0 +1,24 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "evotrader"
+version = "0.1.0"
+description = "Evolutionary paper-trading agents bred by Claude"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = ["numpy>=1.24"]
+
+[project.optional-dependencies]
+llm = ["anthropic>=1.0"]
+dev = ["pytest>=7", "anthropic>=1.0"]
+
+[project.scripts]
+evotrader = "evotrader.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["evotrader*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

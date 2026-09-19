@@ -1,0 +1,35 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Start the MCP server and its tunnel at login, and restart them if they die.
+
+    cp scripts/com.mcp-tunnel.plist ~/Library/LaunchAgents/
+    launchctl load ~/Library/LaunchAgents/com.mcp-tunnel.plist
+
+  Edit CHANGE_ME first. A sleeping Mac still takes the connector down with it.
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.mcp-tunnel</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/bash</string>
+    <string>/Users/CHANGE_ME/path/to/repo/scripts/tunnel-up.sh</string>
+  </array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+    <key>TUNNEL_HOSTNAME</key>
+    <string>mcp.CHANGE_ME.com</string>
+    <key>START_CMD</key>
+    <string>python3 -m yourpkg serve-http</string>
+  </dict>
+  <key>WorkingDirectory</key>
+  <string>/Users/CHANGE_ME/path/to/repo</string>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+  <key>StandardOutPath</key><string>/tmp/mcp-tunnel.out</string>
+  <key>StandardErrorPath</key><string>/tmp/mcp-tunnel.err</string>
+</dict>
+</plist>

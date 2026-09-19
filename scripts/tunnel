@@ -1,0 +1,239 @@
+#!/usr/bin/env bash
+# tunnel — bring an MCP server and its Cloudflare tunnel up, and set itself up
+# the first time it runs.  START_CMD in ~/.mcp-tunnel.conf is how it starts the
+# server; leave it empty if something else already runs it.
+#
+#   tunnel           start everything (sets up on first run), print the URL
+#   tunnel stop      stop both
+#   tunnel status    what is running, and whether the public URL answers
+#   tunnel url       print the connector URL
+#   tunnel setup     change the saved settings
+#   tunnel install   add the `tunnel` command to your shell
+#
+# Both processes are started detached, so closing the terminal does not kill
+# them.
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+CONFIG_FILE="${MCP_TUNNEL_CONFIG:-$HOME/.mcp-tunnel.conf}"
+LOG_DIR="${LOG_DIR:-$HOME/.mcp-tunnel}"
+
+say()  { printf '%s\n' "$*"; }
+warn() { printf '%s\n' "$*" >&2; }
+die()  { printf 'error: %s\n' "$*" >&2; exit 1; }
+
+load_config() {
+    # shellcheck disable=SC1090
+    [ -f "$CONFIG_FILE" ] && . "$CONFIG_FILE"
+    PORT="${PORT:-8787}"
+    ENDPOINT="${ENDPOINT:-/mcp}"
+    START_CMD="${START_CMD:-}"
+    TUNNEL_NAME="${TUNNEL_NAME:-mcp}"
+    TUNNEL_HOSTNAME="${TUNNEL_HOSTNAME:-}"
+}
+
+public_url() {
+    # Always succeeds: a function that ends on a failing test takes its caller
+    # down with it under `set -e`, silently.
+    if [ -n "${TUNNEL_HOSTNAME:-}" ]; then
+        printf 'https://%s%s' "$TUNNEL_HOSTNAME" "$ENDPOINT"
+    else
+        local url
+        url=$(grep -oE 'https://[a-z0-9-]+\.trycloudflare\.com' \
+              "$LOG_DIR/tunnel.log" 2>/dev/null | head -1 || true)
+        [ -n "$url" ] && printf '%s%s' "$url" "$ENDPOINT"
+    fi
+    return 0
+}
+
+alive() { [ -f "$LOG_DIR/$1.pid" ] && kill -0 "$(cat "$LOG_DIR/$1.pid")" 2>/dev/null; }
+
+serving() {
+    # A live PID is not the same as a working server: a pid file goes stale and
+    # a recycled PID belongs to something else. Ask the port.
+    curl -fsS -m 3 "http://127.0.0.1:$PORT/health" >/dev/null 2>&1
+}
+
+# ------------------------------------------------------------------- setup
+
+cmd_setup() {
+    say "Setting up the tunnel. Enter is fine for any default."
+    say ""
+    local hostname name port server
+    read -r -p "Permanent hostname (blank = a new random URL each run): " hostname
+    if [ -n "$hostname" ]; then
+        read -r -p "Cloudflare tunnel name [${TUNNEL_NAME:-mcp}]: " name
+        name="${name:-${TUNNEL_NAME:-mcp}}"
+    fi
+    read -r -p "Command that starts your MCP server [${START_CMD:-}]: " server
+    read -r -p "Port it listens on [${PORT:-8787}]: " port
+
+    cat > "$CONFIG_FILE" <<EOF
+# written by \`tunnel setup\`
+TUNNEL_HOSTNAME="${hostname}"
+TUNNEL_NAME="${name:-mcp}"
+START_CMD="${server:-${START_CMD:-}}"
+PORT="${port:-${PORT:-8787}}"
+ENDPOINT="${ENDPOINT:-/mcp}"
+EOF
+    say ""
+    say "saved to $CONFIG_FILE"
+    if [ -n "$hostname" ]; then
+        say ""
+        say "If you have not created that tunnel yet, once only:"
+        say "  cloudflared tunnel login"
+        say "  cloudflared tunnel create ${name:-mcp}"
+        say "  cloudflared tunnel route dns ${name:-mcp} $hostname"
+    fi
+}
+
+ensure_deps() {
+    if ! command -v cloudflared >/dev/null; then
+        command -v brew >/dev/null || die "cloudflared is missing and brew is not installed"
+        say "installing cloudflared..."
+        brew install cloudflared >/dev/null || die "could not install cloudflared"
+    fi
+}
+
+# ---------------------------------------------------------------------- up
+
+cmd_up() {
+    [ -f "$CONFIG_FILE" ] || { cmd_setup; load_config; }
+    ensure_deps
+    mkdir -p "$LOG_DIR"
+
+    if alive server && alive tunnel; then
+        say "already running"
+        cmd_url
+        return 0
+    fi
+    # A half-dead pair is worse than a stopped one.
+    if alive server || alive tunnel; then cmd_down >/dev/null 2>&1 || true; fi
+
+    # Something already on the port, started by hand or by an older setup: use
+    # it rather than racing it for the port.
+    local adopted=""
+    if serving; then
+        say "something is already serving on :$PORT — leaving it alone"
+        adopted=1
+    fi
+    # Two cloudflared processes running the same tunnel register as replicas,
+    # and Cloudflare then splits requests between them at random.
+    if ! alive tunnel && pgrep -f "cloudflared tunnel" >/dev/null 2>&1; then
+        die "a cloudflared tunnel is already running (pid $(pgrep -f 'cloudflared tunnel' | head -1)).
+Stop it first — two copies of one tunnel become replicas, and requests get
+split between them."
+    fi
+
+    cd "$REPO_DIR"
+    if [ -n "$START_CMD" ] && [ -z "$adopted" ]; then
+        # shellcheck disable=SC2086
+        nohup $START_CMD >"$LOG_DIR/server.log" 2>&1 &
+        echo $! > "$LOG_DIR/server.pid"
+    fi
+
+    local ready=""
+    for _ in $(seq 1 40); do
+        if curl -fsS "http://127.0.0.1:$PORT/health" >/dev/null 2>&1; then ready=1; break; fi
+        sleep 0.25
+    done
+    [ -n "$ready" ] || { warn "the server did not start:"; tail -5 "$LOG_DIR/server.log" >&2; exit 1; }
+    say "server up on :$PORT"
+
+    if [ -n "$TUNNEL_HOSTNAME" ]; then
+        nohup cloudflared tunnel --url "http://localhost:$PORT" run "$TUNNEL_NAME" \
+            >"$LOG_DIR/tunnel.log" 2>&1 &
+    else
+        nohup cloudflared tunnel --url "http://localhost:$PORT" \
+            >"$LOG_DIR/tunnel.log" 2>&1 &
+    fi
+    echo $! > "$LOG_DIR/tunnel.pid"
+
+    local url=""
+    for _ in $(seq 1 60); do
+        url=$(public_url)
+        [ -n "$url" ] && break
+        sleep 1
+    done
+    [ -n "$url" ] || { warn "the tunnel did not come up:"; tail -5 "$LOG_DIR/tunnel.log" >&2; exit 1; }
+
+    # Check the whole path, not just the parts: a 502 here means the tunnel is
+    # live and the server is not, which is the one failure that looks like a
+    # tunnel problem and is not.
+    local code=""
+    for _ in $(seq 1 10); do
+        code=$(curl -s -o /dev/null -w '%{http_code}' -m 5 "${url%$ENDPOINT}/health" || true)
+        [ "$code" = "200" ] && break
+        sleep 1
+    done
+    say ""
+    if [ "$code" = "200" ]; then
+        say "  MCP server URL:  $url"
+    else
+        say "  MCP server URL:  $url"
+        warn "  (the public address answered $code, not 200 — give it a few"
+        warn "   seconds and run \`tunnel status\`)"
+    fi
+    say ""
+    say "running in the background; \`tunnel stop\` when you are done"
+}
+
+cmd_down() {
+    local stopped=0
+    for name in server tunnel; do
+        if alive "$name"; then kill "$(cat "$LOG_DIR/$name.pid")" 2>/dev/null && stopped=1; fi
+        rm -f "$LOG_DIR/$name.pid"
+    done
+    if [ "$stopped" = 1 ]; then say "stopped"; else say "nothing was running"; fi
+}
+
+cmd_status() {
+    if alive server; then say "server   running"; else say "server   stopped"; fi
+    if alive tunnel; then say "tunnel   running"; else say "tunnel   stopped"; fi
+    local url; url=$(public_url)
+    if [ -n "$url" ]; then
+        local code
+        code=$(curl -s -o /dev/null -w '%{http_code}' -m 10 "${url%$ENDPOINT}/health" 2>/dev/null || true)
+        [ -z "$code" ] || [ "$code" = "000" ] && code="unreachable"
+        say "public   $code  $url"
+        if [ "$code" = "502" ]; then
+            say "         (502 = the tunnel is up but the server is not)"
+        fi
+    fi
+}
+
+cmd_url() {
+    local url; url=$(public_url)
+    if [ -n "$url" ]; then say "$url"; else say "no URL yet — run \`tunnel\`"; fi
+}
+
+cmd_install() {
+    local marker="# >>> mcp tunnel >>>"
+    local rc="$HOME/.zshrc"
+    [ -n "${BASH_VERSION:-}" ] && [ ! -f "$rc" ] && rc="$HOME/.bashrc"
+    if grep -q "$marker" "$rc" 2>/dev/null; then
+        say "already installed in $rc"
+    else
+        {
+            printf '\n%s\n' "$marker"
+            printf 'tunnel() { "%s/scripts/tunnel" "$@"; }\n' "$REPO_DIR"
+            printf '%s\n' "# <<< mcp tunnel <<<"
+        } >> "$rc"
+        say "added \`tunnel\` to $rc"
+    fi
+    say "open a new terminal, or run:  source $rc"
+}
+
+load_config
+case "${1:-up}" in
+    ""|up|start) cmd_up ;;
+    stop|down)   cmd_down ;;
+    restart)     cmd_down; cmd_up ;;
+    status)      cmd_status ;;
+    url)         cmd_url ;;
+    setup)       cmd_setup ;;
+    install)     cmd_install ;;
+    logs)        tail -n "${2:-20}" "$LOG_DIR/server.log" ;;
+    *)           die "unknown command: $1 (try: up, stop, status, url, setup, install, logs)" ;;
+esac

@@ -1,0 +1,6 @@
+# Core runtime needs only numpy.
+numpy>=1.24
+
+# Needed for Claude-driven breeding (`--breeder llm` / `hybrid`).
+# Offline runs (`--breeder mutation`) work without it.
+anthropic>=1.0
